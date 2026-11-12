@@ -60,6 +60,28 @@ class Event:
 
 
 @dataclass(frozen=True)
+class TranslationCheck:
+    agent: str
+    passed: bool
+    detail: str
+    seconds: float
+
+
+@dataclass(frozen=True)
+class QueryTranslation:
+    original: str
+    english: str
+    reverse: str
+    checks: tuple[TranslationCheck, ...]
+    seconds: float
+    override: str = ""
+
+    @property
+    def approved(self) -> bool:
+        return bool(self.english) and all(check.passed for check in self.checks)
+
+
+@dataclass(frozen=True)
 class Report:
     plan: SearchPlan
     sources: tuple[SourceResult, ...]
@@ -67,3 +89,4 @@ class Report:
     evidence: tuple[Evidence, ...]
     findings: tuple[Finding, ...]
     events: tuple[Event, ...]
+    translation: QueryTranslation | None = None

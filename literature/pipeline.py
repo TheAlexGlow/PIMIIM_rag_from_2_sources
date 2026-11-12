@@ -9,15 +9,16 @@ from xml.etree.ElementTree import ParseError
 
 import requests
 
-from .models import Article, Event, Evidence, Finding, Report, SearchPlan, Source, SourceResult
+from .models import Article, Event, Evidence, Finding, QueryTranslation, Report, SearchPlan, Source, SourceResult
 from .sources import SourceError, clean
 
 STOPWORDS = frozenset("""
 a an and are as at be by can did do does effect effects for from had has have how in
 into is it of on or our that the their these this to using versus vs was were what
 when where which who why will with would impact role evidence study studies
+about between find information literature papers publications regarding related relationship research
 """.split())
-TOKEN_PATTERN = re.compile(r"[a-z0-9]+", re.I)
+TOKEN_PATTERN = re.compile(r"[a-z]+[a-z0-9]*|[0-9]+(?:[.,][0-9]+)?[a-z0-9]*", re.I)
 EVIDENCE_LIMIT = 8
 
 RESPONSE_SCHEMA = {
@@ -43,8 +44,8 @@ RESPONSE_SCHEMA = {
 
 
 def terms_in(text: str) -> list[str]:
-    return [term for term in TOKEN_PATTERN.findall(text.casefold())
-            if term not in STOPWORDS and len(term) > 1]
+    return [term.replace(",", ".") for term in TOKEN_PATTERN.findall(text.casefold())
+            if term not in STOPWORDS and (len(term) > 1 or term.isdecimal())]
 
 
 def word_form(term: str) -> str:
@@ -55,15 +56,22 @@ def word_form(term: str) -> str:
     return term
 
 
+def english_terms(keywords: str) -> tuple[str, ...]:
+    terms = tuple(dict.fromkeys(terms_in(keywords)))
+    if re.search(r"[^\x00-\x7f]", keywords) or not any(re.search("[a-z]", term) for term in terms):
+        raise ValueError("Введите ключевые слова на английском, например «sleep duration hypertension».")
+    if len(terms) > 12 or len(keywords) > 220:
+        raise ValueError("Допускается до 12 значимых слов и до 220 символов в запросе.")
+    return terms
+
+
 def make_plan(question: str, keywords: str, start_year: int, end_year: int,
               limit: int, sources: tuple[Source, ...]) -> SearchPlan:
     keywords = clean(keywords)
     question = clean(question)
-    terms = tuple(dict.fromkeys(terms_in(keywords)))
-    if re.search(r"[^\x00-\x7f]", keywords) or not terms or not any(term.isalpha() for term in terms):
-        raise ValueError("Введите ключевые слова на английском, например «sleep duration hypertension».")
-    if len(terms) > 12 or len(keywords) > 220 or len(question) > 600:
-        raise ValueError("Допускается до 12 ключевых слов и до 600 символов в вопросе.")
+    terms = english_terms(keywords)
+    if len(question) > 600:
+        raise ValueError("Допускается до 600 символов в вопросе для сводки.")
     if not 1900 <= start_year <= end_year <= 2100:
         raise ValueError("Проверьте диапазон годов.")
     if not sources or not 1 <= limit <= 20:
@@ -243,7 +251,7 @@ def run_agent(agent, plan: SearchPlan) -> tuple[SourceResult, float]:
 
 
 def run_pipeline(plan: SearchPlan, agents: dict, *, synthesis: SynthesisAgent | None = None,
-                 on_event=None) -> Report:
+                 translation: QueryTranslation | None = None, on_event=None) -> Report:
     events = []
 
     def emit(agent: str, detail: str, seconds: float):
@@ -252,6 +260,12 @@ def run_pipeline(plan: SearchPlan, agents: dict, *, synthesis: SynthesisAgent | 
         if on_event is not None:
             on_event(event)
 
+    if translation:
+        emit("Переводчик Bergamot", translation.english or "Модель не вернула перевод.", translation.seconds)
+        for check in translation.checks:
+            emit(check.agent, check.detail, check.seconds)
+        if translation.override:
+            emit("Ручное подтверждение", translation.override, 0.0)
     emit("Маршрутизатор", f"{', '.join(plan.sources)} · {' AND '.join(plan.terms)}", 0.0)
     results = {}
     with ThreadPoolExecutor(max_workers=len(plan.sources)) as pool:
@@ -279,4 +293,4 @@ def run_pipeline(plan: SearchPlan, agents: dict, *, synthesis: SynthesisAgent | 
         findings = extractive(evidence)
         detail = "Показаны фрагменты аннотаций." if evidence else "Аннотаций для сводки нет."
     emit("Суммаризатор", detail, monotonic() - started)
-    return Report(plan, sources, articles, evidence, findings, tuple(events))
+    return Report(plan, sources, articles, evidence, findings, tuple(events), translation)

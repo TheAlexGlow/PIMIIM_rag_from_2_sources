@@ -1,12 +1,14 @@
 import json
 import os
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date
 
 import streamlit as st
 
-from literature.models import Report, Source
+from literature.bergamot import BergamotTranslator
+from literature.models import QueryTranslation, Report, Source
 from literature.pipeline import SynthesisAgent, make_plan, run_pipeline
+from literature.query_translation import needs_translation, review_translation
 from literature.sources import BMCAgent, PMCAgent
 
 DEMO_KEYWORDS = "sleep duration hypertension"
@@ -33,10 +35,32 @@ def article_links(article):
         column.link_button(str(source), url, use_container_width=True)
 
 
+def render_translation(translation: QueryTranslation):
+    with st.expander("Перевод и его проверка", expanded=not translation.approved and not translation.override):
+        st.caption("Исходный запрос")
+        st.text(translation.original)
+        if translation.english:
+            st.caption("Перевод на английский")
+            st.text(translation.english)
+        if translation.reverse:
+            st.caption("Обратный перевод")
+            st.text(translation.reverse)
+        for check in translation.checks:
+            if check.passed:
+                st.caption(f"{check.agent} · {check.detail}")
+            else:
+                st.warning(f"{check.agent} · {check.detail}")
+        if translation.override:
+            st.caption("Подтверждённый запрос")
+            st.text(translation.override)
+
+
 def render_report(report: Report):
     st.divider()
     st.subheader("Результаты поиска")
     st.caption(f"{report.plan.keywords} · {report.plan.start_year}–{report.plan.end_year}")
+    if report.translation:
+        render_translation(report.translation)
 
     metrics = st.columns(len(report.sources) + 1)
     for column, result in zip(metrics, report.sources):
@@ -97,6 +121,28 @@ def render_report(report: Report):
         )
 
 
+def execute_search(keywords, question, start, end, limit, sources, synthesis, translation=None):
+    try:
+        plan = make_plan(question, keywords, start, end, limit, sources)
+    except ValueError as error:
+        st.error(str(error))
+        return False
+
+    email = setting("LITERATURE_CONTACT_EMAIL")
+    agents = {
+        Source.PMC: PMCAgent(email, setting("NCBI_API_KEY")),
+        Source.BMC: BMCAgent(email),
+    }
+    with st.status("Выполняется поиск", expanded=False) as status:
+        report = run_pipeline(
+            plan, agents, synthesis=synthesis, translation=translation,
+            on_event=lambda event: st.text(f"{event.agent} · {event.detail}"),
+        )
+        st.session_state["literature_report"] = report
+        status.update(label="Поиск завершён", state="complete", expanded=False)
+    return True
+
+
 def main():
     st.set_page_config(page_title="Поиск медицинских публикаций", layout="centered")
     st.title("Поиск медицинских публикаций")
@@ -105,13 +151,14 @@ def main():
     api_key = setting("OPENAI_API_KEY")
     this_year = date.today().year
     with st.form("literature-search"):
-        keywords = st.text_input(
-            "Ключевые слова на английском", value=DEMO_KEYWORDS, max_chars=220,
-            help="Введите до 12 значимых слов через пробел. Валидатор ищет их в названии или аннотации.",
+        query = st.text_input(
+            "Поисковый запрос на русском или английском", value=DEMO_KEYWORDS, max_chars=220,
+            help="Например, «астма у детей». Русский запрос переводится на CPU. "
+                 "Агенты ищут до 12 значимых слов в названии или аннотации.",
         )
         question = st.text_input(
             "Вопрос для сводки на русском (необязательно)", max_chars=600, disabled=not api_key,
-            help="Доступно при подключении OpenAI. Поиск всегда использует английские ключевые слова.",
+            help="Доступно при подключении OpenAI. Если поле пустое, используется поисковый запрос.",
         )
         left, middle, right = st.columns(3)
         start = left.number_input("Год с", 1900, this_year, 2018)
@@ -126,26 +173,35 @@ def main():
         submitted = st.form_submit_button("Найти публикации", type="primary")
 
     if submitted:
-        try:
-            plan = make_plan(question if use_model else "", keywords, start, end, limit, tuple(sources))
-        except ValueError as error:
-            st.error(str(error))
+        st.session_state.pop("translation_pending", None)
+        summary_question = (question.strip() or query) if use_model and api_key else ""
+        options = (summary_question, start, end, limit, tuple(sources))
+        synthesis = SynthesisAgent(api_key, setting("OPENAI_MODEL", "gpt-4.1-mini")) if use_model and api_key else None
+        if needs_translation(query):
+            with st.spinner("Перевод и проверка запроса"):
+                translation = review_translation(query, BergamotTranslator())
+            if translation.approved:
+                execute_search(translation.english, *options, synthesis, translation)
+            else:
+                st.session_state["translation_pending"] = (translation, options, bool(synthesis))
         else:
-            email = setting("LITERATURE_CONTACT_EMAIL")
-            agents = {
-                Source.PMC: PMCAgent(email, setting("NCBI_API_KEY")),
-                Source.BMC: BMCAgent(email),
-            }
-            model = setting("OPENAI_MODEL", "gpt-4.1-mini")
-            synthesis = SynthesisAgent(api_key, model) if use_model and api_key else None
-            with st.status("Выполняется поиск", expanded=False) as status:
-                report = run_pipeline(plan, agents, synthesis=synthesis, on_event=lambda event: st.text(
-                    f"{event.agent} · {event.detail}"
-                ))
-                st.session_state["literature_report"] = report
-                status.update(label="Поиск завершён", state="complete", expanded=False)
+            execute_search(query, *options, synthesis)
 
-    if report := st.session_state.get("literature_report"):
+    if pending := st.session_state.get("translation_pending"):
+        translation, options, use_model = pending
+        render_translation(translation)
+        with st.form("confirm-translation"):
+            corrected = st.text_input(
+                "Проверьте или введите английский запрос", value=translation.english[:220], max_chars=220,
+            )
+            confirmed = st.form_submit_button("Искать по этому запросу", type="primary")
+        if confirmed:
+            synthesis = SynthesisAgent(api_key, setting("OPENAI_MODEL", "gpt-4.1-mini")) if use_model and api_key else None
+            reviewed = replace(translation, override=corrected.strip())
+            if execute_search(corrected, *options, synthesis, reviewed):
+                st.session_state.pop("translation_pending")
+                st.rerun()
+    elif report := st.session_state.get("literature_report"):
         render_report(report)
 
 
