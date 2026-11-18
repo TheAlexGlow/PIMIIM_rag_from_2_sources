@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "pimiim-clinical-stdio": {
+      "command": "python",
+      "args": ["-m", "clinical_mcp.server"]
+    },
+    "pimiim-clinical-sse": {
+      "url": "http://127.0.0.1:8000/sse"
+    },
+    "pimiim-pubmed": {
+      "url": "https://pubmed.caseyjhand.com/mcp"
+    }
+  }
+}
